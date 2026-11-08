@@ -2,12 +2,17 @@
 //
 //   patient message ─▶ safety check (keywords, instant) ─▶ model ─▶ tool calls? ─▶ run tools ─▶ model ─▶ reply
 //
+// Every action is delivered (and awaited) before the patient is told anything about it. If one
+// doesn't reach the nurses' station, the turn stops there and the patient gets a fixed reply that
+// sends them to their call button (NOT_DELIVERED_REPLY), whatever the model would have said.
+//
 // Kept free of Electron imports so it can be tested directly with Node.
 import {
   createAction,
   EMERGENCY_KINDS,
   ITEM_CATEGORIES,
   NURSE_REASONS,
+  type Delivery,
   type EmergencyKind,
   type ItemCategory,
   type NurseReason,
@@ -21,12 +26,21 @@ export type AgentOptions = {
   model: string
   /** Pseudonymous Patient.id this device is assigned to (null if not configured). */
   patientId: string | null
-  /** Called for every action as soon as it's decided (log it, send it to staff, …). */
-  onAction: (action: PatientAction) => void
+  /** Delivers an action to staff (dispatchAction). Awaited: only 'sent' is confirmed to the patient. */
+  onAction: (action: PatientAction) => Promise<Delivery>
   timeoutMs?: number
 }
 
-export type AgentResult = { reply: string; actions: PatientAction[] }
+/** An action the assistant took, and whether it reached the nurses' station. */
+export type TakenAction = PatientAction & { delivery: Delivery }
+
+export type AgentResult = { reply: string; actions: TakenAction[] }
+
+/** What the patient hears when an action didn't reach the nurses' station (failed, or a demo/offline device). */
+export const NOT_DELIVERED_REPLY = {
+  emergency: "I couldn't reach the nurses' station. Press your call button now, or call out for help.",
+  other: "I couldn't reach the nurses' station right now. Please use your call button if you need someone.",
+}
 
 export const SYSTEM_PROMPT = `You are a friendly bedside assistant for a patient in a hospital room. The patient talks to you by voice or text, and your replies are read aloud.
 
@@ -171,21 +185,36 @@ const oneOf = <T extends string>(v: unknown, allowed: readonly T[], fallback: T)
 
 export async function runAgent(history: ChatMessage[], opts: AgentOptions): Promise<AgentResult> {
   const patientMessage = [...history].reverse().find((m) => m.role === 'user')?.content ?? ''
-  const actions: PatientAction[] = []
-  const record = (spec: Parameters<typeof createAction>[0], source: PatientAction['source'], detail?: string) => {
+  const actions: TakenAction[] = []
+  /** Create an action and deliver it to staff, waiting for the outcome before anything is said about it. */
+  const record = async (spec: Parameters<typeof createAction>[0], source: PatientAction['source'], detail?: string) => {
     const action = createAction(spec, { patientId: opts.patientId, source, patientMessage, detail })
-    actions.push(action)
-    opts.onAction(action)
-    return action
+    let delivery: Delivery
+    try {
+      delivery = await opts.onAction(action)
+    } catch (err) {
+      console.error('[agent] delivering an action threw:', err)
+      delivery = 'failed'
+    }
+    const taken: TakenAction = { ...action, delivery }
+    actions.push(taken)
+    return taken
+  }
+  const undelivered = () => actions.some((a) => a.delivery !== 'sent')
+  const notDelivered = (): AgentResult => {
+    console.error('[agent] an action did not reach the nurses: telling the patient to use the call button')
+    return { reply: notDeliveredReply(actions), actions }
   }
 
   const messages: OllamaMessage[] = [{ role: 'system', content: SYSTEM_PROMPT }, ...history]
 
-  // 1. Safety net first: alert staff instantly, then tell the model it's done.
+  // 1. Safety net first: alert staff straight away, then tell the model it's done. If the alert
+  //    didn't get through, tell the patient to press their call button without waiting for the model.
   let emergencySent = false
   const detected = detectEmergency(patientMessage)
   if (detected) {
-    record({ type: 'emergency', category: detected }, 'safety_check')
+    await record({ type: 'emergency', category: detected }, 'safety_check')
+    if (undelivered()) return notDelivered()
     emergencySent = true
     messages.push({
       role: 'system',
@@ -193,12 +222,15 @@ export async function runAgent(history: ChatMessage[], opts: AgentOptions): Prom
     })
   }
 
-  // 2. Let the model reply, running any tools it asks for.
-  const runTool = (name: string, args: Record<string, unknown>): string => {
+  // 2. Let the model reply, running any tools it asks for. A tool only reports success to the model
+  //    once the action has been delivered.
+  const NOT_SENT = 'NOT delivered: the nurses were not told.'
+  const runTool = async (name: string, args: Record<string, unknown>): Promise<string> => {
     switch (name) {
       case 'request_item': {
         const category = oneOf<ItemCategory>(args.category, ITEM_CATEGORIES, 'other')
-        const action = record({ type: 'item_request', category, item: str(args.item) }, 'assistant', str(args.details) || str(args.item))
+        const action = await record({ type: 'item_request', category, item: str(args.item) }, 'assistant', str(args.details) || str(args.item))
+        if (action.delivery !== 'sent') return NOT_SENT
         return `Request sent to staff: ${action.label}. Staff will bring it if it's okay for this patient.`
       }
       case 'call_nurse': {
@@ -206,13 +238,15 @@ export async function runAgent(history: ChatMessage[], opts: AgentOptions): Prom
         // The small model sometimes files bathroom help under "mobility"; staff need to know it's the bathroom.
         if (BATHROOM.test(patientMessage)) category = 'bathroom'
         const priority = oneOf(args.priority, ['routine', 'soon', 'urgent'] as const, 'soon')
-        const action = record({ type: 'nurse_call', category, priority }, 'assistant', str(args.details))
+        const action = await record({ type: 'nurse_call', category, priority }, 'assistant', str(args.details))
+        if (action.delivery !== 'sent') return NOT_SENT
         return `The nurse has been notified (${priority}): ${action.label}.`
       }
       case 'emergency_alert': {
         if (emergencySent) return 'An emergency alert was already sent for this. Staff are on the way.'
         const category = oneOf<EmergencyKind>(args.kind, EMERGENCY_KINDS, 'other')
-        record({ type: 'emergency', category }, 'assistant', str(args.details))
+        const action = await record({ type: 'emergency', category }, 'assistant', str(args.details))
+        if (action.delivery !== 'sent') return NOT_SENT
         emergencySent = true
         return 'Emergency alert sent. Staff are on the way.'
       }
@@ -223,7 +257,7 @@ export async function runAgent(history: ChatMessage[], opts: AgentOptions): Prom
 
   let reply = ''
   try {
-    for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+    rounds: for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
       const res = await fetch(`${opts.ollamaHost}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -247,24 +281,38 @@ export async function runAgent(history: ChatMessage[], opts: AgentOptions): Prom
       }
       messages.push({ role: 'assistant', content: message.content ?? '', tool_calls: message.tool_calls })
       for (const call of message.tool_calls) {
-        const result = runTool(call.function.name, call.function.arguments ?? {})
+        const result = await runTool(call.function.name, call.function.arguments ?? {})
+        // Stop at the first action that didn't get through: the patient needs the fallback now.
+        if (undelivered()) break rounds
         messages.push({ role: 'tool', tool_name: call.function.name, content: result })
       }
     }
   } catch (err) {
-    // The model failed, but any actions already recorded have been sent.
+    // The model failed, but any actions already recorded have been delivered.
     if (!actions.length) throw err
     console.error('[agent] model failed after taking actions:', err)
   }
 
+  if (undelivered()) return notDelivered()
   return { reply: reply || fallbackReply(actions), actions }
 }
 
-/** Used if the model gives no usable reply, so the patient always hears something accurate. */
+/** Used if the model gives no usable reply, so the patient always hears something accurate.
+ *  Only called when every action was delivered. */
 function fallbackReply(actions: PatientAction[]): string {
   if (actions.some((a) => a.type === 'emergency')) {
     return "I've alerted the nursing staff and help is on the way. Please press your call button now if you can."
   }
   if (actions.length) return "I've let the staff know. Someone will be with you soon."
   return "Sorry, I didn't catch that. Could you say it again?"
+}
+
+/** The reply when an action didn't reach the nurses' station. Fixed wording: the model can't soften it. */
+function notDeliveredReply(actions: TakenAction[]): string {
+  const sent = actions.filter((a) => a.delivery === 'sent')
+  if (actions.some((a) => a.delivery !== 'sent' && a.type === 'emergency')) return NOT_DELIVERED_REPLY.emergency
+  // An emergency that did get through matters more than a request that didn't; its reply already
+  // tells the patient to press the call button.
+  if (sent.some((a) => a.type === 'emergency')) return fallbackReply(sent)
+  return NOT_DELIVERED_REPLY.other
 }

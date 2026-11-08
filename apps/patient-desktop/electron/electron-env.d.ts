@@ -77,6 +77,8 @@ type AiAction = {
   type: 'item_request' | 'nurse_call' | 'emergency'
   priority: 'routine' | 'soon' | 'urgent' | 'emergency'
   summary: string
+  /** False if it didn't reach the nurses' station (the reply then sends the patient to the call button). */
+  delivered: boolean
 }
 
 type VoiceEvent =

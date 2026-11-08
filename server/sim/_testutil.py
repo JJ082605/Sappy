@@ -5,6 +5,7 @@ Not a test module itself: `unittest discover` only collects files matching test*
 
 from __future__ import annotations
 
+import io
 import json
 import sys
 import threading
@@ -75,3 +76,55 @@ def request(url: str, body: Optional[dict] = None, headers: Optional[dict] = Non
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read())
+
+
+# --- Without a port: some sandboxes and CI runners don't allow binding one ----------------------
+
+def offline_server(sim: VitalsSimulator, **kwargs: Any) -> Any:
+    """A SimServer that isn't bound to a port and isn't ticking; send it requests with call().
+    Call server.server_close() when done (e.g. via addCleanup)."""
+    from cli import SimServer
+
+    return SimServer(("127.0.0.1", 0), sim, interval_sec=0.05, speed=1, bind_and_activate=False, **kwargs)
+
+
+class _MemoryConnection:
+    """Just enough of a socket for the request handler: it reads the request from memory and
+    collects the response."""
+
+    def __init__(self, request: bytes):
+        self._request = io.BytesIO(request)
+        self.response = bytearray()
+
+    def makefile(self, mode: str, *args: Any) -> io.BytesIO:
+        return self._request  # only asked for 'rb'; responses go through sendall()
+
+    def sendall(self, data: bytes) -> None:
+        self.response += data
+
+    def settimeout(self, *args: Any) -> None:
+        pass
+
+    def setsockopt(self, *args: Any) -> None:
+        pass
+
+
+def call(server: Any, method: str, path: str, body: Any = None,
+         headers: Optional[dict] = None) -> Tuple[int, Any, Dict[str, str]]:
+    """Run one HTTP request through the server's real Handler, in memory. `body` is JSON-encoded
+    unless it's bytes. Returns (status, decoded JSON body, response headers)."""
+    from cli import Handler
+
+    data = b"" if body is None else body if isinstance(body, bytes) else json.dumps(body).encode()
+    head = [f"{method} {path} HTTP/1.1", "Host: test", "Content-Type: application/json",
+            f"Content-Length: {len(data)}", *(f"{k}: {v}" for k, v in (headers or {}).items())]
+    conn = _MemoryConnection(("\r\n".join(head) + "\r\n\r\n").encode("latin-1") + data)
+    Handler(conn, ("127.0.0.1", 0), server)  # handles the request, then stops at end of input
+    raw_head, _, rest = bytes(conn.response).partition(b"\r\n\r\n")
+    status_line, *header_lines = raw_head.decode("latin-1").split("\r\n")
+    response_headers = dict(line.split(": ", 1) for line in header_lines)
+    length = int(response_headers["Content-Length"])
+    if rest[length:]:
+        raise AssertionError("more than one response to one request (was an unread body parsed as another "
+                             f"request?): {rest[length:][:120]!r}")
+    return int(status_line.split()[1]), json.loads(rest[:length]), response_headers

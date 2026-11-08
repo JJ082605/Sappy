@@ -28,10 +28,11 @@ function sanitize(messages: unknown): ChatMessage[] {
   })
 }
 
-/** What the page gets back: the spoken reply plus a short summary of any actions taken. */
+/** What the page gets back: the spoken reply plus a short summary of any actions taken, and
+ *  whether each one reached the nurses' station. */
 export type ChatResponse = {
   reply: string
-  actions: { id: string; type: PatientAction['type']; priority: PatientAction['priority']; summary: string }[]
+  actions: { id: string; type: PatientAction['type']; priority: PatientAction['priority']; summary: string; delivered: boolean }[]
 }
 
 export function registerAiHandlers() {
@@ -43,7 +44,12 @@ export function registerAiHandlers() {
       onAction: dispatchAction,
     })
     // `label` is a fixed, non-free-text label (e.g. "water", "help to the bathroom").
-    return { reply, actions: actions.map(({ id, type, priority, label }) => ({ id, type, priority, summary: label })) }
+    return {
+      reply,
+      actions: actions.map(({ id, type, priority, label, delivery }) => ({
+        id, type, priority, summary: label, delivered: delivery === 'sent',
+      })),
+    }
   })
 
   // The page shows which patient this device is assigned to (or why it isn't).

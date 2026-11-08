@@ -6,6 +6,7 @@ Used by `python3 server/sim/cli.py serve` when SUPABASE_URL and SUPABASE_SECRET_
     upsert the ward's patients + in-progress encounters, finish encounters from older runs
   - every tick: upsert one `vitals` row per patient, keyed on patient_id - the patient's existing
     row is updated in place, or created if it doesn't exist yet. No history accumulates.
+  - per patient request (POST /patient-requests, see patient_requests.py): insert one `alerts` row.
 
 Uses the secret key (sb_secret_..., bypasses Row Level Security), so it must only run server-side
 (Render or a laptop) - never in a browser. Ground truth (which scenario is running) is NOT written:
@@ -75,8 +76,10 @@ class SupabaseSink:
         return cls(create_client(url, key, options=options))
 
     def reset(self) -> None:
-        """Delete all vitals and alerts (a fresh demo run). Patients/encounters are upserted anyway."""
+        """Delete all alerts, held readings and vitals (a fresh demo run). Patients/encounters are
+        upserted anyway."""
         self.client.table("alerts").delete().not_.is_("id", "null").execute()
+        self.client.table("held_readings").delete().not_.is_("id", "null").execute()
         self.client.table("vitals").delete().not_.is_("patient_id", "null").execute()
 
     def admit(self, sim: VitalsSimulator) -> None:
@@ -101,6 +104,11 @@ class SupabaseSink:
         if readings:
             rows = [vitals_row(r) for r in readings]
             self.client.table("vitals").upsert(rows, on_conflict="patient_id", returning=RETURN_MINIMAL).execute()
+
+    def insert_alert(self, row: Dict[str, Any]) -> None:
+        """Insert one `alerts` row (patient_id, encounter_id, tier, news2_score, reason).
+        Runs on the calling thread, so the caller learns whether it was written."""
+        self.client.table("alerts").insert(row, returning=RETURN_MINIMAL).execute()
 
 
 class BackgroundWriter:

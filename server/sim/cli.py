@@ -2,7 +2,7 @@
 
     python3 server/sim/cli.py demo                      # scripted demo, fast-forwarded, printed every 15 sim-min
     python3 server/sim/cli.py serve --demo              # scripted demo live: 1 tick / 2 s = 15 hospital min
-    python3 server/sim/cli.py serve --demo --reset      # ...and clear Supabase vitals/alerts first
+    python3 server/sim/cli.py serve --demo --reset      # ...and clear Supabase vitals/alerts/held readings first
     python3 server/sim/cli.py serve --speed 30          # free-running (random events) on http://127.0.0.1:8765
     python3 server/sim/cli.py stream --speed 30         # JSON lines on stdout (one batch per line)
 
@@ -13,8 +13,8 @@ admitted to a bed; the bed label is display-only - key everything on patientId /
 `serve` also writes every tick to Supabase (sim/supabase_sink.py) when SUPABASE_URL and
 SUPABASE_SECRET_KEY are set (needs the venv: pip install -r requirements.txt).
 
-Server endpoints. CORS is open; on a public host (Render) set SIM_CONTROL_TOKEN so the POSTs need
-`Authorization: Bearer <token>`:
+Server endpoints. CORS is open; on a public host (Render) set SIM_CONTROL_TOKEN so the demo-control
+POSTs (/patients/<id>/...) need `Authorization: Bearer <token>`:
     GET  /health                       {"ok": true, "supabase": bool} (Render health check)
     GET  /patients                     patients (+ encounter/bed, baseline, active events)
     GET  /scenarios                    available scenario names
@@ -25,6 +25,11 @@ Server endpoints. CORS is open; on a public host (Render) set SIM_CONTROL_TOKEN 
     POST /patients/<id>/oxygen         body: {"on": true}
     POST /patients/<id>/consciousness  body: {"level": "C"}   ("A"|"C"|"V"|"P"|"U", or null = automatic)
     POST /patients/<id>/artifact       body (optional): {"vital": "spo2Percent", "value": 75}  one-off bad reading
+
+Patient app (Sappy) requests -> Supabase `alerts` rows. Uses its own token, PATIENT_REQUEST_TOKEN (never
+SIM_CONTROL_TOKEN), and is disabled when that isn't set. Body and responses: see patient_requests.py.
+    POST /patient-requests             body: {"patientId": "...", "type": "nurse_call", "category": "pain",
+                                              "priority": "soon", "source": "assistant"}
 
 From the browser:
     const es = new EventSource('http://127.0.0.1:8765/stream')
@@ -63,6 +68,7 @@ from vitals_sim import (  # noqa: E402  (also puts the repo root on sys.path for
     select_ward,
 )
 from pylib.env import load_dotenv  # noqa: E402
+from patient_requests import MAX_BODY_BYTES, PatientRequests, bearer_matches  # noqa: E402
 from supabase_sink import BackgroundWriter, SupabaseSink  # noqa: E402
 
 
@@ -123,12 +129,13 @@ class SimServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, address, sim: VitalsSimulator, interval_sec: float, speed: float,
-                 sink=None, control_token: str = ""):
-        super().__init__(address, Handler)
+                 sink=None, control_token: str = "", patient_request_token: str = "",
+                 bind_and_activate: bool = True):
         self.sim = sim
         self.sink = sink  # SupabaseSink or None
         self.writer = BackgroundWriter(sink) if sink is not None else None
         self.control_token = control_token
+        self.patient_requests = PatientRequests(patient_request_token, sink, self.encounter_id)
         self.lock = threading.Lock()  # guards self.sim
         self.tick = threading.Condition()  # guards latest / latest_frame / seq
         self.latest: list = []
@@ -136,9 +143,16 @@ class SimServer(ThreadingHTTPServer):
         self.seq = 0
         self.stopped = threading.Event()
         self._ticker = threading.Thread(target=self._run, args=(interval_sec, speed), daemon=True)
+        # Last: if binding fails (port in use), socketserver calls server_close(), which needs the above.
+        super().__init__(address, Handler, bind_and_activate)
 
     def start_ticking(self) -> None:
         self._ticker.start()
+
+    def encounter_id(self, patient_id: str) -> str:
+        """The patient's in-progress encounter on this ward. KeyError if they aren't on it."""
+        with self.lock:
+            return self.sim.admission(patient_id).encounter_id
 
     def _run(self, interval_sec: float, speed: float) -> None:
         next_tick = time.monotonic()
@@ -227,12 +241,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
-    def _json(self, status: int, body) -> None:
+    def _json(self, status: int, body, close: bool = False) -> None:
         data = json.dumps(body).encode()
         self.send_response(status)
         self._cors()
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        if close:  # e.g. the request body was left unread; this also sets self.close_connection
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
 
@@ -280,13 +296,18 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
-        m = _POST_ROUTE.fullmatch(self.path.split("?")[0])
+        path = self.path.split("?")[0]
+        if path == "/patient-requests":
+            return self._patient_request()
+        # Answers sent before reading the body close the connection: on a keep-alive connection the
+        # unread body would otherwise be parsed as the next request.
+        m = _POST_ROUTE.fullmatch(path)
         if not m:
-            return self._json(404, {"error": "not found"})
+            return self._json(404, {"error": "not found"}, close=True)
         patient_id, action = m.groups()
         token = self.server.control_token
-        if token and self.headers.get("Authorization") != f"Bearer {token}":
-            return self._json(401, {"error": "missing or wrong Authorization: Bearer <SIM_CONTROL_TOKEN>"})
+        if token and not bearer_matches(self.headers.get("Authorization"), token):
+            return self._json(401, {"error": "missing or wrong Authorization: Bearer <SIM_CONTROL_TOKEN>"}, close=True)
         try:
             body = self._body()
             with self.server.lock:
@@ -296,6 +317,27 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": str(e).strip("'\"")})
         except (ValueError, json.JSONDecodeError) as e:
             self._json(400, {"error": str(e)})
+
+    def _patient_request(self) -> None:
+        """POST /patient-requests from the patient app (patient_requests.py). The token is checked
+        before the body is read; answers that leave the body unread close the connection."""
+        desk = self.server.patient_requests
+        denied = desk.authorize(self.headers.get("Authorization"))
+        if denied:
+            return self._json(*denied, close=True)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length > MAX_BODY_BYTES:
+            return self._json(413, {"error": f"body is over {MAX_BODY_BYTES} bytes"}, close=True)
+        if length <= 0:
+            return self._json(400, {"error": "body must be a JSON object (with a Content-Length)"}, close=True)
+        try:
+            body = json.loads(self.rfile.read(length))
+        except ValueError:  # JSONDecodeError, or bytes that aren't UTF-8
+            return self._json(400, {"error": "body must be JSON"})
+        self._json(*desk.submit(body))
 
     def _sse(self) -> None:
         self.send_response(200)
@@ -338,9 +380,15 @@ def cmd_serve(args: argparse.Namespace) -> None:
         print(f"Supabase: admitted {len(sim.patients)} patients, writing vitals every tick", flush=True)
     else:
         print("Supabase: off (set SUPABASE_URL + SUPABASE_SECRET_KEY to enable)", flush=True)
+    if not args.patient_request_token:
+        print("Patient requests: off (set PATIENT_REQUEST_TOKEN to accept POST /patient-requests)", flush=True)
+    elif not sink:
+        print("Patient requests: token set, but Supabase is off, so POST /patient-requests answers 503", flush=True)
+    else:
+        print("Patient requests: on (POST /patient-requests -> alerts)", flush=True)
 
-    server = SimServer((args.host, args.port), sim, args.interval, args.speed,
-                       sink=sink, control_token=args.control_token)
+    server = SimServer((args.host, args.port), sim, args.interval, args.speed, sink=sink,
+                       control_token=args.control_token, patient_request_token=args.patient_request_token)
     server.start_ticking()
     print(f"Vitals simulator on http://{args.host}:{server.server_address[1]}  "
           f"({len(sim.patients)} patients, every {args.interval}s, speed x{args.speed:g})  Ctrl-C to stop", flush=True)
@@ -387,12 +435,15 @@ def main(argv=None) -> None:
         if name == "serve":
             p.add_argument("--demo", action="store_true",
                            help=f"scripted demo: {DEMO_INTERVAL_SEC:g} s ticks = {DEMO_TICK_MIN} sim-min, random events off")
-            p.add_argument("--reset", action="store_true", help="delete Supabase vitals + alerts before starting")
+            p.add_argument("--reset", action="store_true",
+                           help="delete Supabase vitals, alerts + held readings before starting")
             p.add_argument("--no-supabase", action="store_true", help="don't write to Supabase even if configured")
             p.add_argument("--host", default=env("SIM_HOST", "127.0.0.1"))
             p.add_argument("--port", type=int, default=int(env("SIM_PORT", 8765)))
             p.add_argument("--control-token", default=env("SIM_CONTROL_TOKEN", ""),
-                           help="require `Authorization: Bearer <token>` on POSTs")
+                           help="require `Authorization: Bearer <token>` on the demo-control POSTs")
+            p.add_argument("--patient-request-token", default=env("PATIENT_REQUEST_TOKEN", ""),
+                           help="token the patient app sends to POST /patient-requests (unset = endpoint off)")
 
     args = parser.parse_args(argv)
     for key, value in (_DEMO if args.__dict__.get("demo") else _FREE_RUNNING).items():

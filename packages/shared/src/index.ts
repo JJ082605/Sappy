@@ -58,6 +58,9 @@ export interface VitalsRow {
 
 export type AlertTier = 'watch' | 'check soon' | 'go now'
 
+/** 'incomplete' = waiting for a nurse; 'completed' = a nurse handled it ("I'm on it"). */
+export type AlertStatus = 'incomplete' | 'completed'
+
 export interface AlertRow {
   id: number
   patient_id: string
@@ -66,16 +69,33 @@ export interface AlertRow {
   tier: AlertTier
   news2_score: number | null
   reason: string
-  acknowledged_at: string | null
+  status: AlertStatus
+  /** Set (database time) when status becomes 'completed'; null while incomplete. */
+  completed_at: string | null
 }
 
 /**
- * Columns a writer supplies when inserting an alert (`id`, `created_at` and `acknowledged_at`
- * are filled by the database / the nurse). Used by the NEWS2 worker's alerts and by the patient
+ * Columns a writer supplies when inserting an alert (`id`, `created_at`, `status` and
+ * `completed_at` are filled by the database / the nurse). Used by the NEWS2 worker's alerts and by the patient
  * app's assistant (item requests, nurse calls, emergencies; `news2_score` is null for those).
  * `reason` must never contain patient free text.
  */
 export type NewAlertRow = Pick<AlertRow, 'patient_id' | 'encounter_id' | 'tier' | 'news2_score' | 'reason'>
+
+/**
+ * A reading the NEWS2 persistence rule held back and the next reading did not confirm (e.g. a loose
+ * SpO2 probe), written by the alert worker. Not an alert: nobody is paged, nothing to acknowledge.
+ */
+export interface HeldReadingRow {
+  id: number
+  patient_id: string
+  encounter_id: string
+  created_at: string // when the worker wrote it (after the next reading)
+  recorded_at: string // the held reading's own (simulated) time
+  held_tier: AlertTier // the tier that reading alone would have raised
+  news2_score: number
+  reason: string // NEWS2 reasons joined with "; ", same format as AlertRow.reason
+}
 
 export interface EncounterRow {
   id: string

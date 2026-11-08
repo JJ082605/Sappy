@@ -41,6 +41,9 @@ class FakeQuery:
         self.call.update(op=op, data=data, kwargs=kwargs)
         return self
 
+    def insert(self, data, **kw):
+        return self._op("insert", data, **kw)
+
     def upsert(self, data, **kw):
         return self._op("upsert", data, **kw)
 
@@ -132,11 +135,20 @@ class SinkTests(unittest.TestCase):
         self.sink.write([])
         self.assertEqual(len(self.client.log), 1)  # empty batch: no request
 
-    def test_reset_clears_alerts_then_vitals(self):
+    def test_reset_clears_alerts_held_readings_then_vitals(self):
         self.sink.reset()
         self.assertEqual([(c["table"], c["op"], c["filters"]) for c in self.client.log], [
             ("alerts", "delete", [("not.is", "id", "null")]),
+            ("held_readings", "delete", [("not.is", "id", "null")]),
             ("vitals", "delete", [("not.is", "patient_id", "null")]),
+        ])
+
+    def test_insert_alert_inserts_one_row(self):
+        row = {"patient_id": "p0", "encounter_id": self.sim.admission("p0").encounter_id, "tier": "watch",
+               "news2_score": None, "reason": "Patient request: water"}
+        self.sink.insert_alert(row)
+        self.assertEqual(self.client.log, [
+            {"table": "alerts", "op": "insert", "data": row, "filters": [], "kwargs": MINIMAL},
         ])
 
     def test_from_env_none_when_unconfigured(self):
@@ -282,17 +294,18 @@ class RealClientTests(unittest.TestCase):
         self.sink.write(sim.step(5))
         got = [(r["method"], r["path"]) for r in self.requests]
         self.assertEqual(got, [
-            ("DELETE", "/rest/v1/alerts"), ("DELETE", "/rest/v1/vitals"),
+            ("DELETE", "/rest/v1/alerts"), ("DELETE", "/rest/v1/held_readings"), ("DELETE", "/rest/v1/vitals"),
             ("DELETE", "/rest/v1/patients"), ("POST", "/rest/v1/patients"), ("POST", "/rest/v1/encounters"),
             ("PATCH", "/rest/v1/encounters"), ("POST", "/rest/v1/vitals"),
         ])
-        self.assertEqual(self.requests[1]["query"], {"patient_id": "not.is.null"})
-        self.assertEqual(self.requests[2]["query"], {"id": "not.in.(p0,p1)"})
-        self.assertEqual(self.requests[3]["query"]["on_conflict"], "id")
+        self.assertEqual(self.requests[1]["query"], {"id": "not.is.null"})
+        self.assertEqual(self.requests[2]["query"], {"patient_id": "not.is.null"})
+        self.assertEqual(self.requests[3]["query"], {"id": "not.in.(p0,p1)"})
+        self.assertEqual(self.requests[4]["query"]["on_conflict"], "id")
         ids = ",".join(sim.admission(f"p{i}").encounter_id for i in range(2))
-        self.assertEqual(self.requests[5]["query"], {"id": f"not.in.({ids})", "status": "eq.in-progress"})
-        self.assertEqual(self.requests[5]["body"], {"status": "finished"})
-        vitals = self.requests[6]
+        self.assertEqual(self.requests[6]["query"], {"id": f"not.in.({ids})", "status": "eq.in-progress"})
+        self.assertEqual(self.requests[6]["body"], {"status": "finished"})
+        vitals = self.requests[7]
         self.assertEqual(vitals["query"]["on_conflict"], "patient_id")
         self.assertIn("resolution=merge-duplicates", vitals["prefer"])  # upsert, not plain insert
         self.assertEqual(len(vitals["body"]), 2)
@@ -308,6 +321,33 @@ class RealClientTests(unittest.TestCase):
         vitals = self.tables["vitals"]
         self.assertEqual(sorted(vitals), ["p0", "p1"])  # still 2 rows after 10 ticks
         self.assertEqual(vitals["p0"]["recorded_at"], last[0]["recordedAt"])  # holds the latest reading
+
+
+@unittest.skipUnless(HAS_SUPABASE, "supabase package not installed (use the venv)")
+class RealClientInProcessTests(unittest.TestCase):
+    """Real supabase-py client -> httpx.MockTransport: checks the HTTP request without opening a port."""
+
+    def test_insert_alert_request(self):
+        import httpx
+        from supabase import ClientOptions, create_client
+
+        requests = []
+
+        def postgrest(req):
+            requests.append(req)
+            return httpx.Response(201)
+
+        http = httpx.Client(transport=httpx.MockTransport(postgrest))
+        self.addCleanup(http.close)
+        sink = SupabaseSink(create_client("http://supabase.test", "sb_secret_" + "x" * 32,
+                                          options=ClientOptions(httpx_client=http)))
+        row = {"patient_id": "p0", "encounter_id": "e0", "tier": "go now", "news2_score": None,
+               "reason": "Patient reported a possible emergency: a fall"}
+        sink.insert_alert(row)
+        (req,) = requests
+        self.assertEqual((req.method, req.url.path, dict(req.url.params)), ("POST", "/rest/v1/alerts", {}))
+        self.assertEqual(req.headers["Prefer"], "return=minimal")  # a plain insert: no upsert/merge
+        self.assertEqual(json.loads(req.content), row)
 
 
 if __name__ == "__main__":

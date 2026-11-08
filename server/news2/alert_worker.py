@@ -1,4 +1,5 @@
-"""NEWS2 alert worker: watches the `vitals` table in Supabase, scores readings, writes `alerts`.
+"""NEWS2 alert worker: watches the `vitals` table in Supabase, scores readings, writes `alerts`
+(and `held_readings`, see below).
 
     python3 server/news2/alert_worker.py
 
@@ -16,6 +17,14 @@ Alert rule (fewer, better alerts):
     alerted for. Holding a tier doesn't repeat the alert.
   - The bar only drops after the patient has stayed below it for RESET_AFTER readings, so a vital
     wobbling across a band edge (pulse 90 <-> 91) doesn't re-alert every few minutes.
+
+Held readings (never alerts; the nurse dashboard shows them quietly):
+  - A suppressed reading waits for the patient's next scored reading. If that one reaches the same
+    tier, the escalation was real (it alerts as above) and nothing is held. If it's back below that
+    tier (e.g. a loose SpO2 probe), the suppressed reading - its own time, tier, score and reasons -
+    is written to `held_readings`. Dropped if the patient starts over or never has another reading.
+  - Only "check soon" and "go now" are kept; watch-level blips (e.g. systolic 110 once) are not.
+  - Best effort: written after the alerts, and a failed insert is only logged.
 """
 
 from __future__ import annotations
@@ -26,7 +35,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 SERVER_DIR = Path(__file__).resolve().parent.parent  # server/
 REPO_ROOT = SERVER_DIR.parent
@@ -75,6 +84,7 @@ class AlertWorker:
         self.last_seen: Dict[str, str] = {}  # patient_id -> recorded_at of the last reading scored
         self.last_alerted: Dict[str, str] = {}  # patient_id -> tier of the last alert written
         self.below_count: Dict[str, int] = {}  # patient_id -> readings in a row below last_alerted
+        self.pending_held: Dict[str, dict] = {}  # patient_id -> held_readings row awaiting next reading
 
     # --- Supabase reads/writes -----------------------------------------------------------------
 
@@ -94,16 +104,27 @@ class AlertWorker:
         if alerts:
             self.client.table("alerts").insert(alerts).execute()
 
+    def write_held(self, held: List[dict]) -> None:
+        """Best effort: a failed insert is logged and the rows are dropped. Never raises, so
+        held_readings can't stop the worker or cost an alert."""
+        if not held:
+            return
+        try:
+            self.client.table("held_readings").insert(held).execute()
+        except Exception:
+            log.exception("couldn't write %d held reading(s); dropped", len(held))
+
     # --- Scoring -------------------------------------------------------------------------------
 
     def forget(self, pid: str) -> None:
         """Start a patient over (e.g. the simulator restarted and its clock went back)."""
         self.monitor.reset(pid)
-        for state in (self.last_alerted, self.below_count):
+        for state in (self.last_alerted, self.below_count, self.pending_held):
             state.pop(pid, None)
 
-    def process(self, rows: List[dict]) -> List[dict]:
-        """Score rows whose reading is new since the last poll; return the alert rows to insert."""
+    def process(self, rows: List[dict]) -> Tuple[List[dict], List[dict]]:
+        """Score rows whose reading is new since the last poll.
+        Returns (alerts rows, held_readings rows) to insert."""
         new = [r for r in rows if r["recorded_at"] != self.last_seen.get(r["patient_id"])]
         new.sort(key=lambda r: r["recorded_at"])
 
@@ -111,7 +132,7 @@ class AlertWorker:
         if unknown:
             self.load_patients(unknown)
 
-        alerts = []
+        alerts, held = [], []
         for row in new:
             pid = row["patient_id"]
             prev_seen = self.last_seen.get(pid)
@@ -125,9 +146,27 @@ class AlertWorker:
                 log.warning("skipping vitals for %s at %s: %s", pid, row["recorded_at"], e)
                 continue
 
+            # Settle the reading suppressed last time: this reading reaching its tier too confirms
+            # the escalation (nothing held); back below it means it was held back for good.
+            pending = self.pending_held.pop(pid, None)
+            if pending and TIER_RANK[res.news2.tier] < TIER_RANK[pending["held_tier"]]:
+                log.info("held %s: %s (NEWS2 %d) at %s, not confirmed by the next reading",
+                         pid, pending["held_tier"], pending["news2_score"], pending["recorded_at"])
+                held.append(pending)
+
             if res.suppressed:
                 log.info("suppressed %s: %s (NEWS2 %d) held at %s",
                          pid, res.news2.tier, res.news2.total, res.alert_tier)
+            # Watch-level blips aren't stored: they'd be clutter, and storing less is privacy-first.
+            if res.suppressed and TIER_RANK[res.news2.tier] >= TIER_RANK["check soon"]:
+                self.pending_held[pid] = {  # written by the next reading if that doesn't confirm it
+                    "patient_id": pid,
+                    "encounter_id": row["encounter_id"],
+                    "recorded_at": row["recorded_at"],
+                    "held_tier": res.news2.tier,  # the tier this reading alone would have raised
+                    "news2_score": res.news2.total,
+                    "reason": "; ".join(res.news2.reasons),
+                }
 
             tier, bar = res.alert_tier, self.last_alerted.get(pid, "none")
             if TIER_RANK[tier] > TIER_RANK[bar]:
@@ -146,11 +185,12 @@ class AlertWorker:
                     self.last_alerted[pid], self.below_count[pid] = tier, 0
             else:
                 self.below_count[pid] = 0
-        return alerts
+        return alerts, held
 
     def poll_once(self) -> int:
-        alerts = self.process(self.fetch_vitals())
+        alerts, held = self.process(self.fetch_vitals())
         self.write_alerts(alerts)
+        self.write_held(held)  # after the alerts, and never raises
         return len(alerts)
 
     def run(self, interval: float) -> None:

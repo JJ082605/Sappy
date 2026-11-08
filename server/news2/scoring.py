@@ -263,8 +263,10 @@ def _reasons(r: dict, scores: Dict[str, int], spo2_scale: int) -> List[str]:
 @dataclass(frozen=True)
 class MonitorResult:
     news2: News2Result  # score of this reading alone
-    alert_tier: str  # confirmed tier: the highest tier held for the last `confirm_readings` readings
+    alert_tier: str  # confirmed tier (see News2Monitor)
     suppressed: bool  # True when this reading alone would alert higher than alert_tier
+    confirmed_score: int = 0  # NEWS2 total, confirmed by the same rule as alert_tier
+    confirmed_scores: Dict[str, int] = field(default_factory=dict)  # each NEWS2 input, same rule
 
     def to_json(self) -> dict:
         return {**self.news2.to_json(), "alertTier": self.alert_tier, "suppressed": self.suppressed}
@@ -273,31 +275,35 @@ class MonitorResult:
 @dataclass
 class _PatientHistory:
     spo2_scale: int = 1
-    tiers: Deque[str] = field(default_factory=deque)
+    recent: Deque[News2Result] = field(default_factory=deque)  # the last `window` readings' scores
 
 
 class News2Monitor:
-    """Scores readings per patient and only escalates once a tier has persisted.
+    """Scores readings per patient and only escalates once a tier is confirmed.
 
-    The confirmed alert tier is the highest tier that every one of the last `confirm_readings`
-    readings reached. One bad reading (loose probe, patient moving) is reported as `suppressed`
-    instead of raising the alert; two in a row escalate. De-escalation is immediate.
+    A tier is confirmed when the latest reading reaches it and so do at least `confirm_readings`
+    of the last `window` readings (default: 2 of the last 3). One bad reading (loose probe, patient
+    moving) is reported as `suppressed` instead of raising the alert, while a deterioration that
+    dips back across a band edge now and then (NEWS2 7, 6, 7) still confirms. De-escalation is
+    immediate: the confirmed tier never exceeds the latest reading's. The same rule gives
+    `confirmed_score` (NEWS2 total) and `confirmed_scores` (each input).
 
-    A brand-new patient counts as "none" for the readings before their first, so their first
-    reading can't escalate on its own either.
+    A brand-new patient counts as all zeros ("none") for the readings before their first, so their
+    first reading can't escalate on its own either. confirm_readings=2, window=2 is "2 in a row".
     """
 
-    def __init__(self, confirm_readings: int = 2) -> None:
-        if confirm_readings < 1:
-            raise ValueError("confirm_readings must be >= 1")
+    def __init__(self, confirm_readings: int = 2, window: int = 3) -> None:
+        if not 1 <= confirm_readings <= window:
+            raise ValueError("need 1 <= confirm_readings <= window")
         self.confirm_readings = confirm_readings
+        self.window = window
         self._patients: Dict[str, _PatientHistory] = {}
 
     @classmethod
-    def from_patients(cls, patients: Iterable, confirm_readings: int = 2) -> "News2Monitor":
+    def from_patients(cls, patients: Iterable, confirm_readings: int = 2, window: int = 3) -> "News2Monitor":
         """Build from objects with `.id` and `.conditions` (e.g. sim's SimPatient), choosing
         each patient's SpO2 scale from their conditions."""
-        monitor = cls(confirm_readings)
+        monitor = cls(confirm_readings, window)
         for p in patients:
             monitor.set_spo2_scale(p.id, spo2_scale_for(p.conditions))
         return monitor
@@ -317,17 +323,28 @@ class News2Monitor:
         h = self._history(pid)
         result = score_reading(reading, h.spo2_scale)
 
-        h.tiers.append(result.tier)
-        while len(h.tiers) > self.confirm_readings:
-            h.tiers.popleft()
-        window = list(h.tiers) + ["none"] * (self.confirm_readings - len(h.tiers))
-        alert_tier = min(window, key=_TIER_RANK.__getitem__)
+        h.recent.append(result)
+        while len(h.recent) > self.window:
+            h.recent.popleft()
+        recent = list(h.recent)
+        alert_tier = TIERS[self._confirmed([_TIER_RANK[r.tier] for r in recent])]
+        return MonitorResult(
+            news2=result,
+            alert_tier=alert_tier,
+            suppressed=_TIER_RANK[result.tier] > _TIER_RANK[alert_tier],
+            confirmed_score=self._confirmed([r.total for r in recent]),
+            confirmed_scores={k: self._confirmed([r.scores[k] for r in recent]) for k in NEWS2_INPUTS},
+        )
 
-        return MonitorResult(result, alert_tier, _TIER_RANK[result.tier] > _TIER_RANK[alert_tier])
+    def _confirmed(self, values: List[int]) -> int:
+        """The highest value that the latest reading reaches and at least `confirm_readings` of the
+        last `window` readings reach. `values` are oldest first; missing older readings count as 0."""
+        padded = [0] * (self.window - len(values)) + values
+        return min(padded[-1], sorted(padded, reverse=True)[self.confirm_readings - 1])
 
     def reset(self, patient_id: str) -> None:
         """Forget a patient's recent readings (e.g. after transfer); keeps their SpO2 scale."""
-        self._history(patient_id).tiers.clear()
+        self._history(patient_id).recent.clear()
 
     def _history(self, patient_id: str) -> _PatientHistory:
         return self._patients.setdefault(patient_id, _PatientHistory())

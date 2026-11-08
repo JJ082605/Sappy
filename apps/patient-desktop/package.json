@@ -9,6 +9,7 @@
     "build": "tsc -b && vite build && electron-builder",
     "build:renderer": "tsc -b && vite build",
     "typecheck": "tsc -b",
+    "test": "node --test test/*.test.ts",
     "lint": "oxlint",
     "preview": "vite preview"
   },

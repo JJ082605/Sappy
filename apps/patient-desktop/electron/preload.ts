@@ -19,7 +19,7 @@ contextBridge.exposeInMainWorld('ai', {
   chat: (messages: { role: string; content: string }[]) =>
     ipcRenderer.invoke('ai:chat', messages) as Promise<{
       reply: string
-      actions: { id: string; type: string; priority: string; summary: string }[]
+      actions: { id: string; type: string; priority: string; summary: string; delivered: boolean }[]
     }>,
 })
 

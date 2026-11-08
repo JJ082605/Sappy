@@ -13,7 +13,7 @@ services:
     plan: starter
     buildCommand: pip install -r requirements.txt
     # --demo: 1 tick every 2 s = 15 hospital minutes, scripted sepsis + false alarm.
-    # Add --reset to clear Supabase vitals/alerts on every start (including restarts/deploys).
+    # Add --reset to clear Supabase vitals/alerts/held readings on every start (including restarts/deploys).
     startCommand: python server/sim/cli.py serve --demo --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
@@ -28,6 +28,11 @@ services:
       # Required for the POST demo controls (trigger/oxygen/...): send `Authorization: Bearer <token>`.
       - key: SIM_CONTROL_TOKEN
         generateValue: true
+      # Patient app requests (POST /patient-requests -> `alerts`); unset = that endpoint is off. A separate
+      # secret so a patient device can never trigger demo scenarios. Same value goes in each patient
+      # device's apps/patient-desktop/.env (PATIENT_REQUEST_TOKEN, plus SIM_URL = this service's URL).
+      - key: PATIENT_REQUEST_TOKEN
+        sync: false
 
   # NEWS2 alert worker: polls `vitals` every 1 s (latest reading per patient), writes `alerts`.
   - type: worker

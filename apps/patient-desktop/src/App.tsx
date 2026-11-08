@@ -6,11 +6,17 @@ import type { CompanionMood } from './Companion'
 
 type Msg = { role: 'user' | 'assistant'; content: string; actions?: AiAction[] }
 
-// Short confirmation shown under the assistant's reply for each action it took.
+// Short line shown under the assistant's reply for each action it took. Confirmed only if it
+// reached the nurses' station; otherwise it points to the call button, like the spoken reply.
 const ACTION_LABEL: Record<AiAction['type'], (summary: string) => string> = {
   item_request: (s) => `✓ Requested: ${s}`,
   nurse_call: (s) => `✓ Nurse notified: ${s}`,
   emergency: () => '🚨 Emergency alert sent to staff',
+}
+const NOT_SENT_LABEL: Record<AiAction['type'], (summary: string) => string> = {
+  item_request: (s) => `⚠️ Not sent: ${s}. Please use your call button.`,
+  nurse_call: (s) => `⚠️ Nurse not reached: ${s}. Please use your call button.`,
+  emergency: () => '⚠️ Emergency alert NOT sent. Press your call button now.',
 }
 
 function App() {
@@ -94,7 +100,7 @@ function App() {
             </p>
             {m.actions?.map((a) => (
               <p key={a.id}>
-                <small>{ACTION_LABEL[a.type](a.summary)}</small>
+                <small>{(a.delivered ? ACTION_LABEL : NOT_SENT_LABEL)[a.type](a.summary)}</small>
               </p>
             ))}
           </div>

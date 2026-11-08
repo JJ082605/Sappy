@@ -30,9 +30,10 @@ packages/shared/         @repo/shared - TS types shared by both apps (VitalsRead
 server/                  all backend Python (core: standard library only, Python 3.9+)
   Synthea_Gen/synthea.py   runs Synthea -> server/data/raw/{csv,fhir}/ (gitignored)
   Synthea_Gen/transform.py raw FHIR -> scrubbed server/data/clean/ (committed)
-  sim/                     vitals simulator, HTTP/SSE server, Supabase writer (supabase_sink.py)
+  sim/                     vitals simulator, HTTP/SSE server, Supabase writer (supabase_sink.py),
+                           Sappy requests -> `alerts` (patient_requests.py)
   news2/scoring.py         NEWS2 scoring + alert persistence rule
-  news2/alert_worker.py    Render worker: polls Supabase `vitals`, scores, writes `alerts`
+  news2/alert_worker.py    Render worker: polls Supabase `vitals`, scores, writes `alerts` + `held_readings`
   pylib/                   small shared helpers (.env loader, LOINC map)
   supabase/migrations/     Postgres schema, RLS, Realtime (Supabase CLI project lives in server/)
 render.yaml              Render blueprint (simulator web service + NEWS2 alert worker)
@@ -58,7 +59,10 @@ go to the apps as JSON unchanged. Keep the two in sync by hand when fields chang
 
 Python doesn't talk to the apps directly: the simulator writes to Supabase (secret key), the apps
 read with `@supabase/supabase-js` + Realtime (publishable key + sign-in). The exception is the demo
-controls (trigger sepsis, oxygen, ...), which are HTTP POSTs to the simulator on Render. Supabase row
+controls (trigger sepsis, oxygen, ...), which are HTTP POSTs to the simulator on Render. The other
+exception is Sappy: the patient app POSTs each action to the simulator's `/patient-requests`
+(`Authorization: Bearer $PATIENT_REQUEST_TOKEN`, a different secret from `SIM_CONTROL_TOKEN`), and
+the simulator writes the `alerts` row. Supabase row
 types in `packages/shared` mirror the SQL by hand; if they drift, use `supabase gen types typescript`.
 
 ```
@@ -66,6 +70,7 @@ Synthea -> transform -> server/data/clean/ (committed)
                               |
           Render: server/sim --+--> Supabase: patients, encounters, vitals --Realtime--> nurse-web (Vercel)
   Render: news2/alert_worker <-- vitals (poll 1 s), --> alerts ------------Realtime--> patient-desktop
+  patient-desktop (Sappy) --POST /patient-requests--> Render: server/sim --> alerts --Realtime--> nurse-web
 ```
 
 ## Prerequisites
@@ -98,6 +103,8 @@ pnpm sim:serve       #    same demo live on http://127.0.0.1:8765 (2 s = 15 min)
 pnpm test:sim        # simulator + transform + Supabase-writer tests (no network)
 pnpm alerts          # 4. score: NEWS2 alert worker against Supabase (needs the venv + keys)
 pnpm test:alerts     #    alert worker tests (fake Supabase client, no network)
+pnpm --filter nurse-web test   # dashboard logic tests (node --test, no network)
+pnpm --filter patient-desktop test   # Sappy delivery + replies (node --test, no network)
 ```
 
 ## Deployment
@@ -106,7 +113,9 @@ pnpm test:alerts     #    alert worker tests (fake Supabase client, no network)
    `supabase db push`).
    Create staff users under Authentication; RLS lets only signed-in users read.
 2. **Render**: New -> Blueprint -> this repo (`render.yaml`): simulator + alert worker. Set
-   `SUPABASE_URL` and `SUPABASE_SECRET_KEY` on both. `server/data/clean/` must be committed. Free instances sleep and stop the
+   `SUPABASE_URL` and `SUPABASE_SECRET_KEY` on both. Set `PATIENT_REQUEST_TOKEN` on the simulator (long
+   random string; unset = endpoint off); each patient device needs the same value plus `SIM_URL` (the
+   simulator's **https** URL) in `apps/patient-desktop/.env`. Apply migrations before deploying the worker. `server/data/clean/` must be committed. Free instances sleep and stop the
    simulator, so demo on a paid instance. Demo controls need `Authorization: Bearer $SIM_CONTROL_TOKEN`.
 3. **Vercel**: import the repo, set Root Directory to `apps/nurse-web` (keep "Include files outside
    the root directory" on; the app needs `packages/shared` and the root lockfile). Install/build
@@ -130,6 +139,21 @@ pnpm test:alerts     #    alert worker tests (fake Supabase client, no network)
   local `.env`, never in a frontend or a `VITE_` variable. Browsers use the publishable key + sign-in.
 - Scenario ground truth (who is "septic") is never written to Supabase; the alert worker and the
   nurse UI only see the vitals stream.
+- **Nurse dashboard on a shared screen:** lists, hero cards and the privacy screen show bed label +
+  age band only; sex, conditions and medications only in the patient detail view after a click.
+  Patient ids never go in URLs (selection is in memory). The Supabase session is in sessionStorage.
+  After 5 min idle patient details are hidden (bed status stays live); after 30 min showing them
+  needs the password. The session is never ended by inactivity, so alerts keep showing.
+- No third-party requests from the dashboard: fonts are self-hosted, and `apps/nurse-web/vercel.json`
+  sets a CSP whose connect-src is pinned to this project's Supabase host (update it if the project
+  or domain changes, or the dashboard can't reach Supabase).
+- Patient requests carry only the pseudonymous patient id and fixed values (type, category, priority,
+  named item, source). The simulator rejects unknown fields or off-list values (400) and rebuilds tier
+  and reason itself; what the patient said never leaves the device.
+- Sappy's alert reasons are built from fixed categories only; the dashboard shows a label only if it
+  is in its allow-list (mirrors `apps/patient-desktop/electron/actions.ts`), never free text.
+- **Known gap:** Supabase sign-ups are open and RLS only checks "signed in", so any account can read
+  the ward. Fix later: disable sign-ups and restrict policies to `app_metadata.role = 'nurse'`.
 
 ## Data flow (separate, independent steps)
 
@@ -145,7 +169,7 @@ Keep the steps independent so a simulator bug never requires regenerating data.
    (in-progress Encounter + bed), derives a baseline per patient, and emits one reading per patient
    per tick. Scenarios push vitals away from baseline. Deterministic given a seed.
 4. **score**: `server/news2/alert_worker.py` (Render worker) polls `vitals` every 1 s, scores each
-   new reading with `scoring.py`'s `News2Monitor`, and writes `alerts` (see Alerting).
+   new reading with `scoring.py`'s `News2Monitor`, and writes `alerts` and `held_readings` (see Alerting).
 
 Reading shape (one per patient per tick):
 
@@ -206,7 +230,31 @@ Implemented in `server/news2/scoring.py`. NEWS2 tests are owned by a different t
   when a patient's confirmed tier rises above the last tier alerted; holding a tier doesn't repeat
   it. The bar only drops after `RESET_AFTER` (8) readings below it, so a vital wobbling across a
   band edge doesn't re-alert. All tiers are written, including `watch` (the UI shows it quietly).
-  `reason` is the NEWS2 reasons joined. Suppressed readings are logged, not written.
+  `reason` is the NEWS2 reasons joined.
+- **Held readings (`held_readings` rows):** a suppressed reading waits for that patient's next scored
+  reading. If that reading reaches the same tier, the escalation was real: it alerts as usual and
+  nothing is held. If it's back below that tier (e.g. the loose probe), the suppressed reading is
+  written with its own `recorded_at`, `held_tier`, `news2_score` and `reason`. Only `check soon` and
+  `go now` are recorded; watch-level blips aren't. These are not alerts (nobody is paged, nothing to
+  acknowledge): the dashboard shows them only under Activity log -> "Held back". Best effort: written
+  after the alerts, a failed insert is only logged. Apply the migration before deploying the worker.
+- **Patient requests (Sappy):** `server/sim/patient_requests.py` writes `alerts` rows with
+  `news2_score` null. Emergency -> go now; nurse call soon/urgent -> check soon; routine nurse call or
+  item request -> watch. Reason = `alertReason()` in `apps/patient-desktop/electron/actions.ts` (source
+  of truth; the Python mirror is checked by `server/sim/test_patient_requests.py`, which needs Node
+  22.18+). The same patient + type + category within 60 s isn't written again unless more urgent.
+- **Nurse dashboard (`apps/nurse-web`):** "go now" beds get a hero card each; "check soon" queues
+  below; "watch" is folded away. Within a tier: reported emergencies, then a single vital scoring 3,
+  then other vitals alerts, then routine requests. "I'm on it" sets `alerts.status = 'completed'`
+  (+ `completed_at`, stamped by the database) for a bed's open alerts, only where still
+  `'incomplete'` (never overwrites another nurse); Undo reopens only what that tap took. A taken bed
+  stays visible, outlined at the highest tier taken. Beds are drawn at the higher of their alert state
+  and the live confirmed NEWS2 tier (`news2_latest`). The dashboard refetches on every Realtime
+  (re)join and warns when vitals or scores stop arriving.
+- **Alert status (live schema):** `alerts.status` is `'incomplete'` (waiting) or `'completed'` (a nurse
+  handled it), with `completed_at`. This replaced `acknowledged_at`, first directly in the hosted
+  database; `server/supabase/migrations/20261108130000_alert_status.sql` records it (safe to re-run).
+  Change the schema with a migration, never only in the dashboard: the apps and workers depend on it.
 - Later: use Conditions/Meds for context (e.g. beta blockers blunt HR); write alerts back as
   FHIR `Flag` or `Communication` resources.
 
